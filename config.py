@@ -20,8 +20,9 @@ TIER1_FRAMEWORK_THRESHOLD = 4
 TIER2_FRAMEWORK_THRESHOLD = 3
 TIER1_REWARD_RISK = 2.0
 TIER2_REWARD_RISK = 1.5
-REQUEST_TIMEOUT = 10
-REQUEST_DELAY = 2
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2"))
+PROGRESS_INTERVAL = max(1, int(os.getenv("PROGRESS_INTERVAL", "25")))
 PSX_BASE_URL = "https://dps.psx.com.pk"
 SHARIAH_SOURCE_URL = (
     "https://www.scstrade.com/MarketStatistics/MS_MarketValuations.aspx/resdata"

@@ -15,6 +15,7 @@ from config import (
     DATABASE_PATH,
     MAX_STOCK_PRICE,
     MIN_STOCK_PRICE,
+    PROGRESS_INTERVAL,
     PSX_BASE_URL,
     REQUEST_DELAY,
     REQUEST_TIMEOUT,
@@ -268,12 +269,21 @@ def scrape_stocks() -> list[dict[str, Any]]:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     shariah_statuses = get_shariah_statuses(session)
+    symbols = fetch_symbols(session)
+    eligible = [
+        item
+        for item in symbols
+        if shariah_statuses.get(item["symbol"].upper(), "unknown") != "non-compliant"
+    ]
+    LOGGER.info(
+        "Starting PSX quote scan: %s listed equities, %s eligible after explicit non-compliant exclusions",
+        len(symbols),
+        len(eligible),
+    )
     results: list[dict[str, Any]] = []
-    for item in fetch_symbols(session):
+    for index, item in enumerate(eligible, start=1):
         symbol = item["symbol"]
         shariah_status = shariah_statuses.get(symbol.upper(), "unknown")
-        if shariah_status == "non-compliant":
-            continue
         response = _request(session, f"{PSX_BASE_URL}/company/{symbol}")
         if not response:
             continue
@@ -290,6 +300,13 @@ def scrape_stocks() -> list[dict[str, Any]]:
         ):
             stock["price_history"] = fetch_history(session, symbol)
             results.append(stock)
+        if index % PROGRESS_INTERVAL == 0 or index == len(eligible):
+            LOGGER.info(
+                "PSX quote scan progress: %s/%s checked, %s stocks currently qualify",
+                index,
+                len(eligible),
+                len(results),
+            )
     store_stocks(results)
     LOGGER.info("Stored %s qualifying PSX stocks", len(results))
     return results

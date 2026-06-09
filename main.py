@@ -3,6 +3,7 @@
 import argparse
 import logging
 import sys
+import time
 from typing import Any
 
 from analysis.engine import analyze_all
@@ -55,19 +56,29 @@ def parse_args() -> argparse.Namespace:
 
 def run(mode: str, test: bool = False, use_ai: bool = True) -> int:
     """Run the complete research pipeline and deliver its Telegram report."""
+    started_at = time.monotonic()
+    LOGGER.info("Starting PSX pipeline in %s mode%s", mode, " with dummy data" if test else "")
     initialize_database()
     if test:
         stocks, news = dummy_data()
         use_ai = False
     else:
+        LOGGER.info("Stage 1/4: scraping PSX stocks")
         stocks = scrape_stocks()
+        LOGGER.info("Stage 1/4 complete: %s qualifying stocks", len(stocks))
+        LOGGER.info("Stage 2/4: scraping company news")
         news = scrape_news([stock["symbol"] for stock in stocks])
+        LOGGER.info("Stage 2/4 complete: %s articles", len(news))
+    LOGGER.info("Stage 3/4: analyzing %s stocks", len(stocks))
     results = analyze_all(stocks, news, use_ai=use_ai)
+    LOGGER.info("Stage 3/4 complete: %s actionable picks", sum(result["tier"] > 0 for result in results))
     report = format_report(results, stocks, mode)
     print(report)
+    LOGGER.info("Stage 4/4: sending Telegram report")
     if not send_report(report):
         LOGGER.error("Pipeline completed, but Telegram delivery failed")
         return 1
+    LOGGER.info("Pipeline completed successfully in %.1f minutes", (time.monotonic() - started_at) / 60)
     return 0
 
 
@@ -76,6 +87,7 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
     )
     args = parse_args()
     return run(args.mode, test=args.test, use_ai=not args.no_ai)

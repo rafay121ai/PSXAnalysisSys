@@ -42,6 +42,15 @@ python main.py --mode monitoring
 The full scraper is intentionally slow because requests are rate-limited.
 Results are stored in `data/psx.db`, which is excluded from version control.
 
+## Railway
+
+The included `Procfile` starts a one-time discovery worker. A normal run can
+take 20-30 minutes at the default two-second request delay. Railway logs show
+pipeline stages and quote-scan progress every 25 symbols.
+
+Configure Railway variables from `.env.example`. To run discovery on a daily
+schedule, use a Railway cron job rather than an always-restarting service.
+
 ## Important
 
 This project is a research aid, not an autonomous trading system. It does not

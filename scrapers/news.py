@@ -142,10 +142,13 @@ def scrape_news(symbols: list[str]) -> list[dict[str, object]]:
     session.headers.update({"User-Agent": USER_AGENT})
     articles: list[dict[str, object]] = []
     for source, listing_url in NEWS_SOURCES.items():
+        LOGGER.info("Checking news source: %s", source)
         listing = _request(session, listing_url)
         if not listing:
             continue
-        for url in _article_links(listing.text, listing_url):
+        links = _article_links(listing.text, listing_url)
+        LOGGER.info("Found %s candidate articles at %s", len(links), source)
+        for url in links:
             response = _request(session, url)
             if response:
                 articles.append(parse_article(response.text, source, url, symbols))

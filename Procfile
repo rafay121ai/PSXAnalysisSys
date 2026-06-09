@@ -1,1 +1,1 @@
-worker: python main.py --mode discovery
+worker: python -u main.py --mode discovery
