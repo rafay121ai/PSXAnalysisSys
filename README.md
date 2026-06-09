@@ -37,16 +37,25 @@ python main.py --mode discovery --no-ai
 
 # Include open-position status in the report
 python main.py --mode monitoring
+
+# Force the 15-day full-universe watchlist refresh
+python main.py --mode discovery --refresh
 ```
 
-The full scraper is intentionally slow because requests are rate-limited.
-Results are stored in `data/psx.db`, which is excluded from version control.
+Every run checks the persisted watchlist refresh timestamp. When the watchlist
+is empty or at least 15 days old, the system screens the full PSX equity
+universe for confirmed Shariah compliance, price from Rs 0-20, and daily
+volume of at least 500,000 shares. It stores up to the 100 highest-volume
+qualifying stocks. Discovery analyzes that watchlist; monitoring analyzes only
+symbols with open trades. Results are stored in `data/psx.db`, which is
+excluded from version control.
 
 ## Railway
 
-The included `Procfile` starts a one-time discovery worker. A normal run can
-take 20-30 minutes at the default two-second request delay. Railway logs show
-pipeline stages and quote-scan progress every 25 symbols.
+The included `Procfile` starts a one-time discovery worker. Normal discovery
+runs read the persisted watchlist and are fast. The scheduled 15-day refresh is
+slower because it screens the confirmed compliant universe with the required
+two-second request delay.
 
 Configure Railway variables from `.env.example`. To run discovery on a daily
 schedule, use a Railway cron job rather than an always-restarting service.

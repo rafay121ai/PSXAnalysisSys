@@ -9,7 +9,13 @@ from typing import Any
 from analysis.engine import analyze_all
 from bot.telegram import format_report, send_report
 from scrapers.news import scrape_news
-from scrapers.psx import initialize_database, scrape_stocks
+from scrapers.psx import (
+    get_active_position_stocks,
+    get_watchlist,
+    initialize_database,
+    refresh_watchlist,
+    watchlist_needs_refresh,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,10 +57,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("discovery", "monitoring"), default="discovery")
     parser.add_argument("--test", action="store_true", help="Use dummy data and send a Telegram test report")
     parser.add_argument("--no-ai", action="store_true", help="Use keyword catalyst scoring instead of GPT-5.4")
+    parser.add_argument("--refresh", action="store_true", help="Force a full watchlist refresh before analysis")
     return parser.parse_args()
 
 
-def run(mode: str, test: bool = False, use_ai: bool = True) -> int:
+def run(
+    mode: str,
+    test: bool = False,
+    use_ai: bool = True,
+    force_refresh: bool = False,
+) -> int:
     """Run the complete research pipeline and deliver its Telegram report."""
     started_at = time.monotonic()
     LOGGER.info("Starting PSX pipeline in %s mode%s", mode, " with dummy data" if test else "")
@@ -63,9 +75,17 @@ def run(mode: str, test: bool = False, use_ai: bool = True) -> int:
         stocks, news = dummy_data()
         use_ai = False
     else:
-        LOGGER.info("Stage 1/4: scraping PSX stocks")
-        stocks = scrape_stocks()
-        LOGGER.info("Stage 1/4 complete: %s qualifying stocks", len(stocks))
+        if force_refresh or watchlist_needs_refresh():
+            reason = "forced by --refresh" if force_refresh else "empty or older than 15 days"
+            LOGGER.info("Refreshing watchlist because it is %s", reason)
+            refresh_watchlist()
+        if mode == "discovery":
+            stocks = get_watchlist()
+            LOGGER.info("Discovery loaded %s active watchlist stocks", len(stocks))
+        else:
+            stocks = get_active_position_stocks()
+            LOGGER.info("Monitoring loaded %s stocks with active trades", len(stocks))
+        LOGGER.info("Stage 1/4 complete: loaded %s stocks for %s", len(stocks), mode)
         LOGGER.info("Stage 2/4: scraping company news")
         news = scrape_news([stock["symbol"] for stock in stocks])
         LOGGER.info("Stage 2/4 complete: %s articles", len(news))
@@ -90,7 +110,12 @@ def main() -> int:
         stream=sys.stdout,
     )
     args = parse_args()
-    return run(args.mode, test=args.test, use_ai=not args.no_ai)
+    return run(
+        args.mode,
+        test=args.test,
+        use_ai=not args.no_ai,
+        force_refresh=args.refresh,
+    )
 
 
 if __name__ == "__main__":

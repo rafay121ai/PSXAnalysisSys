@@ -5,7 +5,7 @@ import logging
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from config import (
     DATABASE_PATH,
     MAX_STOCK_PRICE,
+    MIN_DAILY_VOLUME,
     MIN_STOCK_PRICE,
     PROGRESS_INTERVAL,
     PSX_BASE_URL,
@@ -23,6 +24,8 @@ from config import (
     SHARIAH_DISCLOSURE_PDF,
     SHARIAH_SOURCE_URL,
     USER_AGENT,
+    WATCHLIST_MAX_SIZE,
+    WATCHLIST_REFRESH_DAYS,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -264,8 +267,135 @@ def store_stocks(stocks: list[dict[str, Any]]) -> None:
         connection.executemany(query, rows)
 
 
-def scrape_stocks() -> list[dict[str, Any]]:
-    """Scrape, filter, persist, and return low-priced Shariah-eligible stocks."""
+def _deserialize_stock(row: sqlite3.Row) -> dict[str, Any]:
+    """Convert a joined SQLite stock row into the analysis-engine object shape."""
+    try:
+        history = json.loads(row["price_history"] or "[]")
+    except json.JSONDecodeError:
+        LOGGER.warning("Stored price history is invalid JSON for %s", row["symbol"])
+        history = []
+    return {
+        "symbol": row["symbol"],
+        "company_name": row["company_name"],
+        "current_price": row["current_price"],
+        "volume": row["volume"],
+        "change_percent": row["change_percent"],
+        "52_week_high": row["week_52_high"],
+        "52_week_low": row["week_52_low"],
+        "sector": row["sector"],
+        "shariah_status": row["shariah_status"],
+        "data_quality": row["data_quality"],
+        "price_history": history,
+    }
+
+
+def _load_stocks_for_query(query: str) -> list[dict[str, Any]]:
+    """Run a fixed stock-loading query and return normalized stock objects."""
+    initialize_database()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        return [_deserialize_stock(row) for row in connection.execute(query).fetchall()]
+
+
+def get_watchlist() -> list[dict[str, Any]]:
+    """Return active watchlist stocks with their latest persisted market data."""
+    return _load_stocks_for_query(
+        """
+        SELECT stocks.*
+        FROM watchlist
+        JOIN stocks ON stocks.symbol = watchlist.symbol
+        WHERE watchlist.active = 1
+        ORDER BY stocks.volume DESC, stocks.symbol ASC
+        """
+    )
+
+
+def get_active_position_stocks() -> list[dict[str, Any]]:
+    """Return persisted stock objects for symbols with currently open trades."""
+    return _load_stocks_for_query(
+        """
+        SELECT stocks.*
+        FROM trades
+        JOIN stocks ON stocks.symbol = trades.symbol
+        WHERE trades.closed_at IS NULL
+        GROUP BY stocks.symbol
+        ORDER BY stocks.symbol ASC
+        """
+    )
+
+
+def get_watchlist_last_refreshed() -> datetime | None:
+    """Return the successful watchlist refresh timestamp, if one exists."""
+    initialize_database()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        row = connection.execute(
+            "SELECT value FROM app_metadata WHERE key = ?",
+            ("watchlist_last_refreshed",),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        refreshed_at = datetime.fromisoformat(row[0])
+        return (
+            refreshed_at
+            if refreshed_at.tzinfo is not None
+            else refreshed_at.replace(tzinfo=timezone.utc)
+        )
+    except ValueError:
+        LOGGER.warning("Stored watchlist refresh timestamp is invalid: %s", row[0])
+        return None
+
+
+def watchlist_needs_refresh(now: datetime | None = None) -> bool:
+    """Return true when the watchlist is empty, missing metadata, or older than configured."""
+    initialize_database()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM watchlist WHERE active = 1"
+        ).fetchone()[0]
+    refreshed_at = get_watchlist_last_refreshed()
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    return (
+        count == 0
+        or refreshed_at is None
+        or current_time - refreshed_at.astimezone(timezone.utc) >= timedelta(days=WATCHLIST_REFRESH_DAYS)
+    )
+
+
+def _replace_watchlist(stocks: list[dict[str, Any]]) -> None:
+    """Replace the active watchlist and record the successful refresh atomically."""
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute("DELETE FROM watchlist")
+        connection.executemany(
+            """
+            INSERT INTO watchlist (symbol, company_name, notes, added_at, active)
+            VALUES (?, ?, ?, ?, 1)
+            """,
+            [
+                (
+                    stock["symbol"],
+                    stock["company_name"],
+                    f"15-day screen: compliant, Rs {stock['current_price']:.2f}, volume {stock['volume']:,}",
+                    now,
+                )
+                for stock in stocks
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO app_metadata (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            ("watchlist_last_refreshed", now, now),
+        )
+
+
+def refresh_watchlist() -> list[dict[str, Any]]:
+    """Scan the full universe and persist the highest-volume hard-filtered stocks."""
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     shariah_statuses = get_shariah_statuses(session)
@@ -273,40 +403,64 @@ def scrape_stocks() -> list[dict[str, Any]]:
     eligible = [
         item
         for item in symbols
-        if shariah_statuses.get(item["symbol"].upper(), "unknown") != "non-compliant"
+        if shariah_statuses.get(item["symbol"].upper()) == "compliant"
     ]
     LOGGER.info(
-        "Starting PSX quote scan: %s listed equities, %s eligible after explicit non-compliant exclusions",
+        "Starting full-universe watchlist scan: %s equities, %s confirmed Shariah compliant",
         len(symbols),
         len(eligible),
     )
-    results: list[dict[str, Any]] = []
+    qualifying: list[dict[str, Any]] = []
     for index, item in enumerate(eligible, start=1):
         symbol = item["symbol"]
-        shariah_status = shariah_statuses.get(symbol.upper(), "unknown")
         response = _request(session, f"{PSX_BASE_URL}/company/{symbol}")
         if not response:
             continue
         stock = parse_company_page(
             response.text,
             item,
-            shariah_status=shariah_status,
+            shariah_status="compliant",
         )
         price = stock.get("current_price")
+        volume = stock.get("volume")
         if (
             price is not None
             and MIN_STOCK_PRICE <= price <= MAX_STOCK_PRICE
-            and stock["shariah_status"] != "non-compliant"
+            and volume is not None
+            and volume >= MIN_DAILY_VOLUME
         ):
             stock["price_history"] = fetch_history(session, symbol)
-            results.append(stock)
+            qualifying.append(stock)
         if index % PROGRESS_INTERVAL == 0 or index == len(eligible):
             LOGGER.info(
-                "PSX quote scan progress: %s/%s checked, %s stocks currently qualify",
+                "Watchlist scan progress: %s/%s checked, %s stocks qualify",
                 index,
                 len(eligible),
-                len(results),
+                len(qualifying),
             )
-    store_stocks(results)
-    LOGGER.info("Stored %s qualifying PSX stocks", len(results))
-    return results
+    selected = sorted(
+        qualifying,
+        key=lambda stock: (stock.get("volume") or 0, stock.get("data_quality") or 0),
+        reverse=True,
+    )[:WATCHLIST_MAX_SIZE]
+    if not selected:
+        LOGGER.error("Watchlist refresh found no qualifying stocks; existing watchlist was preserved")
+        return get_watchlist()
+    if len(selected) < 50:
+        LOGGER.warning(
+            "Only %s stocks met all hard filters; watchlist target is 50-100",
+            len(selected),
+        )
+    store_stocks(selected)
+    _replace_watchlist(selected)
+    LOGGER.info(
+        "Watchlist refresh stored %s of %s qualifying stocks",
+        len(selected),
+        len(qualifying),
+    )
+    return selected
+
+
+def scrape_stocks() -> list[dict[str, Any]]:
+    """Backward-compatible alias for the full watchlist refresh."""
+    return refresh_watchlist()
