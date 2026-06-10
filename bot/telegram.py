@@ -89,7 +89,7 @@ def format_report(
             "",
             f"Data quality: {quality:.0f}% of stocks had complete data",
             "Sources checked: PSX, Dawn, Profit PK, The News, ARY",
-            "Shariah classification: Official PSX Notice N-1419, with SCS Trade fallback",
+            "Shariah classification: Official PSX KMI All Share, with SCS Trade cross-check",
             "",
             "Research aid only. Human review required before any trade.",
         ]
@@ -116,3 +116,8 @@ def send_report(report: str) -> bool:
             LOGGER.error("Telegram report delivery failed: %s", exc)
             return False
     return True
+
+
+def send_system_alert(message: str) -> bool:
+    """Send an operational alert through the existing Telegram delivery path."""
+    return send_report(f"SYSTEM ALERT: {message}")

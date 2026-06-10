@@ -14,7 +14,6 @@ openai==2.41.0
 pandas==3.0.3
 pydantic==2.13.4
 pydantic_core==2.46.4
-pypdf==6.13.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-telegram-bot==22.7

@@ -1,1 +1,1 @@
-worker: python -u main.py --mode discovery
+worker: python main.py --mode discovery --refresh --serve-bot

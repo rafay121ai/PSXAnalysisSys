@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -64,17 +65,26 @@ def _article_links(html: str, base_url: str) -> list[str]:
     return links[:NEWS_MAX_ARTICLES_PER_SOURCE]
 
 
-def _mentioned_symbols(text: str, symbols: list[str]) -> list[str]:
-    """Find exact PSX ticker mentions without matching parts of words."""
-    upper_text = text.upper()
-    return sorted(
-        symbol
-        for symbol in symbols
-        if re.search(rf"(?<![A-Z0-9]){re.escape(symbol.upper())}(?![A-Z0-9])", upper_text)
-    )
+def _mentioned_symbols(text: str, stocks: list[Any]) -> list[str]:
+    """Match an uppercase ticker token or the complete registered company name."""
+    matches: list[str] = []
+    for stock in stocks:
+        raw_symbol = stock.get("symbol") if isinstance(stock, dict) else stock
+        symbol = str(raw_symbol or "").strip().upper()
+        company_name = str(stock.get("company_name") or "").strip() if isinstance(stock, dict) else ""
+        ticker_match = symbol and re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])",
+            text,
+        )
+        normalized_text = re.sub(r"\s+", " ", text).casefold()
+        normalized_company_name = re.sub(r"\s+", " ", company_name).casefold()
+        company_match = normalized_company_name and normalized_company_name in normalized_text
+        if ticker_match or company_match:
+            matches.append(symbol)
+    return sorted(set(matches))
 
 
-def parse_article(html: str, source: str, url: str, symbols: list[str]) -> dict[str, object]:
+def parse_article(html: str, source: str, url: str, stocks: list[Any]) -> dict[str, object]:
     """Extract normalized article fields from heterogeneous news HTML."""
     soup = BeautifulSoup(html, "html.parser")
     headline_node = soup.select_one("h1")
@@ -106,7 +116,7 @@ def parse_article(html: str, source: str, url: str, symbols: list[str]) -> dict[
         "url": url,
         "published_date": published_date,
         "full_text": text[:500],
-        "mentioned_symbols": _mentioned_symbols(searchable, symbols),
+        "mentioned_symbols": _mentioned_symbols(searchable, stocks),
     }
 
 
@@ -136,7 +146,7 @@ def store_news(articles: list[dict[str, object]]) -> None:
         connection.executemany(query, rows)
 
 
-def scrape_news(symbols: list[str]) -> list[dict[str, object]]:
+def scrape_news(stocks: list[Any]) -> list[dict[str, object]]:
     """Scrape configured sources, persist articles, and continue past failures."""
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
@@ -151,7 +161,7 @@ def scrape_news(symbols: list[str]) -> list[dict[str, object]]:
         for url in links:
             response = _request(session, url)
             if response:
-                articles.append(parse_article(response.text, source, url, symbols))
+                articles.append(parse_article(response.text, source, url, stocks))
     store_news(articles)
     LOGGER.info("Stored or deduplicated %s news articles", len(articles))
     return articles

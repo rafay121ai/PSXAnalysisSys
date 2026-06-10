@@ -1,18 +1,22 @@
 """Synchronous PSX stock and price-history scraper."""
 
 import json
+import hashlib
 import logging
 import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
+from bot.telegram import send_system_alert
 from config import (
     DATABASE_PATH,
+    KMI_ALL_SHARE_CONSTITUENTS_URL,
     MAX_STOCK_PRICE,
     MIN_DAILY_VOLUME,
     MIN_STOCK_PRICE,
@@ -21,7 +25,6 @@ from config import (
     REQUEST_DELAY,
     REQUEST_TIMEOUT,
     SCHEMA_PATH,
-    SHARIAH_DISCLOSURE_PDF,
     SHARIAH_SOURCE_URL,
     USER_AGENT,
     WATCHLIST_MAX_SIZE,
@@ -135,44 +138,65 @@ def fetch_shariah_symbols(session: requests.Session) -> set[str] | None:
     return None
 
 
-def load_official_shariah_statuses() -> dict[str, str] | None:
-    """Load explicit compliant and non-compliant symbols from the PSX notice PDF."""
-    if not SHARIAH_DISCLOSURE_PDF.exists():
-        LOGGER.warning("Official PSX Shariah disclosure PDF not found: %s", SHARIAH_DISCLOSURE_PDF)
+def fetch_kmi_all_share_symbols(session: requests.Session) -> set[str] | None:
+    """Return compliant constituents from PSX's authoritative KMI All Share table."""
+    response = _request(session, KMI_ALL_SHARE_CONSTITUENTS_URL)
+    if not response:
+        LOGGER.warning("KMI All Share source unavailable; Shariah gate will fail closed")
         return None
-    try:
-        from pypdf import PdfReader
-
-        text = "\n".join(page.extract_text() or "" for page in PdfReader(SHARIAH_DISCLOSURE_PDF).pages)
-        matches = re.findall(
-            r"^\s*\d+\s+([A-Z0-9-]+)\s+.+?\s+(Non-Compliant|Compliant)\s*$",
-            text,
-            re.MULTILINE,
-        )
-        statuses = {
-            symbol.upper(): _normalize_shariah_status(status)
-            for symbol, status in matches
-        }
-        if not statuses:
-            raise ValueError("No Shariah classifications found in the official PSX notice")
-        LOGGER.info(
-            "Loaded %s compliant and %s non-compliant symbols from official PSX notice",
-            sum(status == "compliant" for status in statuses.values()),
-            sum(status == "non-compliant" for status in statuses.values()),
-        )
-        return statuses
-    except (ImportError, OSError, ValueError) as exc:
-        LOGGER.warning("Could not parse official PSX Shariah disclosure PDF: %s", exc)
+    soup = BeautifulSoup(response.text, "html.parser")
+    rows = soup.select("table tbody tr")
+    symbols = {
+        row.select_one("a.tbl__symbol").get_text(strip=True).upper()
+        for row in rows
+        if row.select_one("a.tbl__symbol")
+        and not any(tag.get_text(strip=True).upper() == "NC" for tag in row.select(".tag"))
+    }
+    if not symbols:
+        LOGGER.warning("KMI All Share source returned no compliant constituents; Shariah gate will fail closed")
         return None
+    LOGGER.info(
+        "Loaded %s compliant constituents from official PSX KMI All Share index",
+        len(symbols),
+    )
+    return symbols
 
 
-def get_shariah_statuses(session: requests.Session) -> dict[str, str]:
-    """Return official classifications, falling back to positive SCS confirmations."""
-    official = load_official_shariah_statuses()
-    if official is not None:
-        return official
+def store_shariah_universe(symbols: set[str]) -> None:
+    """Replace the persisted KMI Shariah universe atomically."""
+    initialize_database()
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute("DELETE FROM shariah_universe")
+        connection.executemany(
+            "INSERT INTO shariah_universe (symbol, fetched_at) VALUES (?, ?)",
+            [(symbol, fetched_at) for symbol in sorted(symbols)],
+        )
+
+
+def _cross_check_scs(session: requests.Session, kmi_symbols: set[str]) -> None:
+    """Log SCS Trade disagreements without allowing SCS to affect the gate."""
     scs_symbols = fetch_shariah_symbols(session)
-    return {symbol: "compliant" for symbol in scs_symbols or set()}
+    if scs_symbols is None:
+        LOGGER.warning("SCS Trade cross-check unavailable; official KMI gate remains authoritative")
+        return
+    only_kmi = sorted(kmi_symbols - scs_symbols)
+    only_scs = sorted(scs_symbols - kmi_symbols)
+    if only_kmi or only_scs:
+        message = (
+            f"Shariah source disagreement: {len(only_kmi)} only in official KMI "
+            f"and {len(only_scs)} only in SCS Trade."
+        )
+        LOGGER.warning("%s", message)
+        send_system_alert(message)
+
+
+def company_page_is_non_compliant(html: str) -> bool:
+    """Return true when a PSX company page displays an NC/non-compliant marker."""
+    soup = BeautifulSoup(html, "html.parser")
+    return any(tag.get_text(strip=True).upper() == "NC" for tag in soup.select(".tag")) or bool(
+        re.search(r"\bNON[- ]COMPLIANT\b", soup.get_text(" ", strip=True), re.IGNORECASE)
+    )
 
 
 def fetch_history(session: requests.Session, symbol: str) -> list[dict[str, Any]]:
@@ -206,7 +230,6 @@ def parse_company_page(
     soup = BeautifulSoup(html, "html.parser")
     stats = soup.select_one(".quote__stats")
     stats_text = stats.get_text(" ", strip=True) if stats else ""
-    page_text = soup.get_text(" ", strip=True)
 
     range_match = re.search(
         r"52-WEEK RANGE\s*\^?\s*([\d,.]+)\s*[—-]\s*([\d,.]+)",
@@ -215,9 +238,7 @@ def parse_company_page(
     )
     volume_match = re.search(r"\bVolume\s+([\d,]+)", stats_text, re.IGNORECASE)
     change_node = soup.select_one(".change__percent")
-    non_compliant = bool(
-        re.search(r"\b(non[- ]shariah|shariah non[- ]compliant)\b", page_text, re.I)
-    )
+    non_compliant = company_page_is_non_compliant(html)
     stock = {
         "symbol": symbol_info["symbol"],
         "company_name": (
@@ -332,6 +353,7 @@ def get_watchlist() -> list[dict[str, Any]]:
         SELECT stocks.*
         FROM watchlist
         JOIN stocks ON stocks.symbol = watchlist.symbol
+        JOIN shariah_universe ON shariah_universe.symbol = stocks.symbol
         WHERE watchlist.active = 1
           AND LOWER(REPLACE(stocks.shariah_status, '_', '-')) = 'compliant'
         ORDER BY stocks.volume DESC, stocks.symbol ASC
@@ -434,16 +456,30 @@ def _replace_watchlist(stocks: list[dict[str, Any]]) -> None:
         )
 
 
+def _clear_watchlist(reason: str) -> None:
+    """Clear the active watchlist when a mandatory gate source is unavailable."""
+    initialize_database()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute("DELETE FROM watchlist")
+    LOGGER.warning("Cleared watchlist because Shariah gate failed closed: %s", reason)
+    send_system_alert(f"Watchlist cleared because Shariah gate failed closed: {reason}.")
+
+
 def refresh_watchlist() -> list[dict[str, Any]]:
     """Scan the full universe and persist the highest-volume hard-filtered stocks."""
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    shariah_statuses = get_shariah_statuses(session)
+    shariah_symbols = fetch_kmi_all_share_symbols(session)
+    if shariah_symbols is None:
+        _clear_watchlist("official PSX KMI All Share source unavailable")
+        return []
+    store_shariah_universe(shariah_symbols)
+    _cross_check_scs(session, shariah_symbols)
     symbols = fetch_symbols(session)
     eligible = [
         item
         for item in symbols
-        if _is_shariah_compliant(shariah_statuses.get(item["symbol"].upper()))
+        if item["symbol"].upper() in shariah_symbols
     ]
     LOGGER.info(
         "Starting full-universe watchlist scan: %s equities, %s confirmed Shariah compliant",
@@ -451,26 +487,33 @@ def refresh_watchlist() -> list[dict[str, Any]]:
         len(eligible),
     )
     qualifying: list[dict[str, Any]] = []
+    page_gate_passed = 0
+    price_gate_passed = 0
+    volume_gate_passed = 0
     for index, item in enumerate(eligible, start=1):
         symbol = item["symbol"]
         response = _request(session, f"{PSX_BASE_URL}/company/{symbol}")
         if not response:
+            LOGGER.warning("Excluded %s because its PSX company page was unavailable", symbol)
             continue
+        if company_page_is_non_compliant(response.text):
+            LOGGER.warning("Excluded %s because its PSX company page is marked non-compliant", symbol)
+            continue
+        page_gate_passed += 1
         stock = parse_company_page(
             response.text,
             item,
             shariah_status="compliant",
         )
-        if not _is_shariah_compliant(stock.get("shariah_status")):
-            LOGGER.warning("Excluded %s after company page flagged it non-compliant", symbol)
-            continue
         price = stock.get("current_price")
         volume = stock.get("volume")
+        price_passed = price is not None and MIN_STOCK_PRICE <= price <= MAX_STOCK_PRICE
+        volume_passed = volume is not None and volume >= MIN_DAILY_VOLUME
+        price_gate_passed += int(price_passed)
+        volume_gate_passed += int(volume_passed)
         if (
-            price is not None
-            and MIN_STOCK_PRICE <= price <= MAX_STOCK_PRICE
-            and volume is not None
-            and volume >= MIN_DAILY_VOLUME
+            price_passed
+            and volume_passed
         ):
             stock["price_history"] = fetch_history(session, symbol)
             qualifying.append(stock)
@@ -481,14 +524,23 @@ def refresh_watchlist() -> list[dict[str, Any]]:
                 len(eligible),
                 len(qualifying),
             )
+    LOGGER.info(
+        "Watchlist refresh funnel: listed=%s, KMI=%s, page-clear=%s, price=%s, volume=%s, all-filters=%s",
+        len(symbols),
+        len(eligible),
+        page_gate_passed,
+        price_gate_passed,
+        volume_gate_passed,
+        len(qualifying),
+    )
     selected = sorted(
         qualifying,
         key=lambda stock: (stock.get("volume") or 0, stock.get("data_quality") or 0),
         reverse=True,
     )[:WATCHLIST_MAX_SIZE]
     if not selected:
-        LOGGER.error("Watchlist refresh found no qualifying stocks; existing watchlist was preserved")
-        return get_watchlist()
+        _clear_watchlist("no stocks passed the mandatory KMI/company-page and market filters")
+        return []
     if len(selected) < 50:
         LOGGER.warning(
             "Only %s stocks met all hard filters; watchlist target is 50-100",
@@ -527,9 +579,89 @@ def _announcement_type(title: str) -> str:
     )
 
 
-def scrape_announcements(symbols: list[str]) -> list[dict[str, str]]:
-    """Fetch recent PSX company announcements and return matches for the supplied symbols."""
-    wanted = {str(symbol).strip().upper() for symbol in symbols if symbol}
+def _announcement_id(row: Any, symbol: str, date: str, title: str) -> str:
+    """Return the PSX document identifier, with a stable fallback when absent."""
+    for node in row.select("[href], [data-images]"):
+        value = node.get("href") or node.get("data-images") or ""
+        match = re.search(r"(\d+)(?:-\d+)?\.(?:pdf|gif|jpg|png)", value, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return hashlib.sha256(f"{symbol}|{date}|{title}".encode("utf-8")).hexdigest()
+
+
+def store_announcements(announcements: list[dict[str, str]]) -> None:
+    """Persist PSX announcements and deduplicate them by source announcement ID."""
+    initialize_database()
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.executemany(
+            """
+            INSERT INTO announcements (
+                announcement_id, symbol, title, date, type, pdf_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(announcement_id) DO UPDATE SET
+                symbol=excluded.symbol, title=excluded.title, date=excluded.date,
+                type=excluded.type, pdf_url=excluded.pdf_url, fetched_at=excluded.fetched_at
+            """,
+            [
+                (
+                    item["announcement_id"],
+                    item["symbol"],
+                    item["title"],
+                    item["date"],
+                    item["announcement_type"],
+                    item.get("pdf_url"),
+                    fetched_at,
+                )
+                for item in announcements
+            ],
+        )
+
+
+def get_announcements(stocks: list[Any]) -> list[dict[str, str]]:
+    """Load persisted announcements for the requested stock symbols."""
+    symbols = sorted(
+        {
+            str(stock.get("symbol") if isinstance(stock, dict) else stock).strip().upper()
+            for stock in stocks
+            if (stock.get("symbol") if isinstance(stock, dict) else stock)
+        }
+    )
+    if not symbols:
+        return []
+    initialize_database()
+    placeholders = ",".join("?" for _ in symbols)
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            f"""
+            SELECT announcement_id, symbol, title, date, type, pdf_url
+            FROM announcements
+            WHERE symbol IN ({placeholders})
+            ORDER BY date DESC, announcement_id DESC
+            """,
+            symbols,
+        ).fetchall()
+    return [
+        {
+            "announcement_id": row["announcement_id"],
+            "symbol": row["symbol"],
+            "title": row["title"],
+            "date": row["date"],
+            "announcement_type": row["type"],
+            "pdf_url": row["pdf_url"],
+        }
+        for row in rows
+    ]
+
+
+def scrape_announcements(stocks: list[Any]) -> list[dict[str, str]]:
+    """Fetch, persist, and reload recent announcements matched by exact symbol."""
+    wanted = {
+        str(stock.get("symbol") if isinstance(stock, dict) else stock).strip().upper()
+        for stock in stocks
+        if (stock.get("symbol") if isinstance(stock, dict) else stock)
+    }
     if not wanted:
         return []
     session = requests.Session()
@@ -549,28 +681,34 @@ def scrape_announcements(symbols: list[str]) -> list[dict[str, str]]:
         },
     )
     if not response:
-        return []
+        LOGGER.warning("Announcements feed unavailable; analysis will use persisted announcements")
+        return get_announcements(stocks)
     announcements: list[dict[str, str]] = []
     soup = BeautifulSoup(response.text, "html.parser")
     for row in soup.select("#announcementsTable tbody tr"):
         cells = row.find_all("td")
         if len(cells) < 5:
             continue
-        symbol = cells[2].get_text(" ", strip=True).upper()
-        if symbol not in wanted:
+        row_symbol = cells[2].get_text(" ", strip=True).upper()
+        if row_symbol not in wanted:
             continue
+        date = cells[0].get_text(" ", strip=True)
         title = cells[4].get_text(" ", strip=True)
+        pdf_node = row.select_one('a[href*="/download/document/"]')
         announcements.append(
             {
-                "symbol": symbol,
+                "announcement_id": _announcement_id(row, row_symbol, date, title),
+                "symbol": row_symbol,
                 "title": title,
-                "date": cells[0].get_text(" ", strip=True),
+                "date": date,
                 "announcement_type": _announcement_type(title),
+                "pdf_url": urljoin(PSX_BASE_URL, pdf_node.get("href")) if pdf_node else "",
             }
         )
+    store_announcements(announcements)
     LOGGER.info(
         "Loaded %s recent PSX announcements matching %s requested symbols",
         len(announcements),
         len(wanted),
     )
-    return announcements
+    return get_announcements(stocks)

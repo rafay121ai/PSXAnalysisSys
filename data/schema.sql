@@ -26,6 +26,23 @@ CREATE TABLE IF NOT EXISTS news (
     scraped_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS announcements (
+    announcement_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    title TEXT NOT NULL,
+    date TEXT NOT NULL,
+    type TEXT NOT NULL,
+    pdf_url TEXT,
+    fetched_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS announcements_symbol_idx ON announcements(symbol);
+
+CREATE TABLE IF NOT EXISTS shariah_universe (
+    symbol TEXT PRIMARY KEY,
+    fetched_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS watchlist (
     symbol TEXT PRIMARY KEY,
     company_name TEXT,
@@ -52,6 +69,23 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl REAL,
     notes TEXT
 );
+
+CREATE TABLE IF NOT EXISTS trade_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+    qty REAL NOT NULL CHECK (qty > 0),
+    price REAL NOT NULL CHECK (price > 0),
+    value REAL NOT NULL CHECK (value > 0),
+    trade_date TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('manual', 'system_signal')),
+    exit_reason TEXT,
+    linked_recommendation_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS trade_log_fifo_idx
+    ON trade_log(symbol, trade_date, id);
 
 CREATE TABLE IF NOT EXISTS framework_weights (
     framework TEXT PRIMARY KEY,

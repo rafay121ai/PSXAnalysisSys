@@ -8,9 +8,14 @@ the human decides.
 ## Data Sources
 
 - Pakistan Stock Exchange Data Portal for symbols, quotes, and EOD history
-- Official PSX Notice N-1419 for explicit Shariah classifications
-- SCS Trade as a positive-confirmation fallback for Shariah compliance
+- Official PSX KMI All Share constituent table for the mandatory Shariah universe
+- SCS Trade as a logged cross-check only; disagreements never alter the PSX gate
 - Dawn, Profit Pakistan Today, The News, and ARY News for catalysts
+
+The Shariah universe is refreshed from
+`https://dps.psx.com.pk/indices/KMIALLSHR`. This is the constituent endpoint
+loaded by PSX's own Market Indices page, and its explicit `NC` row markers are
+excluded before the universe is stored.
 
 ## Setup
 
@@ -40,7 +45,15 @@ python main.py --mode monitoring
 
 # Force the 15-day full-universe watchlist refresh
 python main.py --mode discovery --refresh
+
+# Run the standalone Telegram trade-log command bot
+python -m bot.trade_commands
 ```
+
+The trade bot supports `/buy SYMBOL QTY PRICE [DATE]`, `/sell SYMBOL QTY PRICE
+[DATE]`, `/trades`, and `/stats`. Dates use `YYYY-MM-DD`; omitted dates default
+to today. Trade statistics use FIFO matching and remain separate from position
+sizing.
 
 Every run checks the persisted watchlist refresh timestamp. When the watchlist
 is empty or at least 15 days old, the system screens the full PSX equity

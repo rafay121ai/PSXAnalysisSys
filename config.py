@@ -30,10 +30,7 @@ PSX_BASE_URL = "https://dps.psx.com.pk"
 SHARIAH_SOURCE_URL = (
     "https://www.scstrade.com/MarketStatistics/MS_MarketValuations.aspx/resdata"
 )
-SHARIAH_DISCLOSURE_PDF = (
-    BASE_DIR
-    / "N-1419-List-of-Listed-Companies-Shariah-Disclosures-by-Companies-(Dec-24-2025).pdf"
-)
+KMI_ALL_SHARE_CONSTITUENTS_URL = f"{PSX_BASE_URL}/indices/KMIALLSHR"
 
 DATABASE_PATH = BASE_DIR / "data" / "psx.db"
 SCHEMA_PATH = BASE_DIR / "data" / "schema.sql"

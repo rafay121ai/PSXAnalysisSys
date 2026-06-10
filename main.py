@@ -8,6 +8,7 @@ from typing import Any
 
 from analysis.engine import analyze_all
 from bot.telegram import format_report, send_report
+from bot.trade_commands import run_trade_bot
 from scrapers.news import scrape_news
 from scrapers.psx import (
     get_active_position_stocks,
@@ -59,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test", action="store_true", help="Use dummy data and send a Telegram test report")
     parser.add_argument("--no-ai", action="store_true", help="Use keyword catalyst scoring instead of GPT-5.4")
     parser.add_argument("--refresh", action="store_true", help="Force a full watchlist refresh before analysis")
+    parser.add_argument("--serve-bot", action="store_true", help="Poll Telegram trade commands after analysis")
     return parser.parse_args()
 
 
@@ -89,10 +91,10 @@ def run(
             LOGGER.info("Monitoring loaded %s stocks with active trades", len(stocks))
         LOGGER.info("Stage 1/5 complete: loaded %s stocks for %s", len(stocks), mode)
         LOGGER.info("Stage 2/5: scraping company news")
-        news = scrape_news([stock["symbol"] for stock in stocks])
+        news = scrape_news(stocks)
         LOGGER.info("Stage 2/5 complete: %s articles", len(news))
         LOGGER.info("Stage 3/5: scraping PSX company announcements")
-        announcements = scrape_announcements([stock["symbol"] for stock in stocks])
+        announcements = scrape_announcements(stocks)
         LOGGER.info("Stage 3/5 complete: %s matching announcements", len(announcements))
     LOGGER.info("Stage 4/5: analyzing %s stocks", len(stocks))
     results = analyze_all(stocks, news, use_ai=use_ai, announcements=announcements)
@@ -115,12 +117,16 @@ def main() -> int:
         stream=sys.stdout,
     )
     args = parse_args()
-    return run(
+    result = run(
         args.mode,
         test=args.test,
         use_ai=not args.no_ai,
         force_refresh=args.refresh,
     )
+    if args.serve_bot:
+        LOGGER.info("Starting Telegram command polling for /buy, /sell, /trades, and /stats")
+        run_trade_bot()
+    return result
 
 
 if __name__ == "__main__":
