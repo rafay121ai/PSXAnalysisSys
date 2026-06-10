@@ -169,7 +169,7 @@ def kelly_analysis(win_rate: float = 0.55, avg_win_loss_ratio: float = 1.8) -> d
         if avg_win_loss_ratio > 0
         else 0
     )
-    position = max(0.0, min(0.25, raw_kelly))
+    position = max(0.0, min(0.10, raw_kelly))
     return {
         "win_rate": win_rate,
         "avg_win_loss_ratio": avg_win_loss_ratio,
