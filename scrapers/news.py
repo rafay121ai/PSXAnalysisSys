@@ -30,6 +30,23 @@ NEWS_SOURCES = {
     "ARY News": "https://arynews.tv/category/business",
 }
 
+_TRAILING_LEGAL_SUFFIX = re.compile(
+    r"(?:\s+|\s*\(\s*)"
+    r"(?:limited|ltd\.?|pvt|private|company|corporation|co\.?|mills|industries)"
+    r"(?:\s*\))?\.?\s*$",
+    re.IGNORECASE,
+)
+_GENERIC_SINGLE_TOKEN_NAMES = {
+    "first",
+    "global",
+    "image",
+    "loads",
+    "secure",
+    "systems",
+    "unity",
+    "waves",
+}
+
 
 def _request(session: requests.Session, url: str) -> requests.Response | None:
     """Fetch a news page with retries and a delay between attempts."""
@@ -65,9 +82,28 @@ def _article_links(html: str, base_url: str) -> list[str]:
     return links[:NEWS_MAX_ARTICLES_PER_SOURCE]
 
 
+def _matchable_company_name(company_name: str) -> str:
+    """Return a registered name suitable for strict headline matching."""
+    stripped_name = re.sub(r"\s+", " ", company_name).strip()
+    while stripped_name:
+        without_suffix = _TRAILING_LEGAL_SUFFIX.sub("", stripped_name).strip(" ,.-")
+        if without_suffix == stripped_name:
+            break
+        stripped_name = without_suffix
+
+    tokens = re.findall(r"[A-Za-z0-9]+", stripped_name)
+    if len(tokens) == 1:
+        token = tokens[0].casefold()
+        # Short or known-generic single names are too ambiguous; require their ticker instead.
+        if len(token) <= 3 or token in _GENERIC_SINGLE_TOKEN_NAMES:
+            return ""
+    return stripped_name
+
+
 def _mentioned_symbols(text: str, stocks: list[Any]) -> list[str]:
-    """Match an uppercase ticker token or the complete registered company name."""
+    """Match an uppercase ticker token or a strict stripped company-name phrase."""
     matches: list[str] = []
+    normalized_text = re.sub(r"\s+", " ", text)
     for stock in stocks:
         raw_symbol = stock.get("symbol") if isinstance(stock, dict) else stock
         symbol = str(raw_symbol or "").strip().upper()
@@ -76,9 +112,12 @@ def _mentioned_symbols(text: str, stocks: list[Any]) -> list[str]:
             rf"(?<![A-Za-z0-9]){re.escape(symbol)}(?![A-Za-z0-9])",
             text,
         )
-        normalized_text = re.sub(r"\s+", " ", text).casefold()
-        normalized_company_name = re.sub(r"\s+", " ", company_name).casefold()
-        company_match = normalized_company_name and normalized_company_name in normalized_text
+        matchable_name = _matchable_company_name(company_name)
+        company_match = matchable_name and re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(matchable_name)}(?![A-Za-z0-9])",
+            normalized_text,
+            re.IGNORECASE,
+        )
         if ticker_match or company_match:
             matches.append(symbol)
     return sorted(set(matches))
