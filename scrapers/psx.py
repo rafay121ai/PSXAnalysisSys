@@ -29,6 +29,7 @@ from config import (
 )
 
 LOGGER = logging.getLogger(__name__)
+ANNOUNCEMENTS_URL = "https://dps.psx.com.pk/announcements"
 
 
 def initialize_database() -> None:
@@ -57,6 +58,33 @@ def _request(session: requests.Session, url: str) -> requests.Response | None:
         except requests.RequestException as exc:
             LOGGER.warning("PSX request failed (%s/3) %s: %s", attempt, url, exc)
     return None
+
+
+def _post_request(
+    session: requests.Session,
+    url: str,
+    data: dict[str, Any],
+) -> requests.Response | None:
+    """Post form data with the same retries and throttling as PSX GET requests."""
+    for attempt in range(1, 4):
+        try:
+            time.sleep(REQUEST_DELAY)
+            response = session.post(url, data=data, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            LOGGER.warning("PSX request failed (%s/3) %s: %s", attempt, url, exc)
+    return None
+
+
+def _normalize_shariah_status(value: Any) -> str:
+    """Normalize Shariah status spellings before filtering or persistence."""
+    return str(value or "unknown").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _is_shariah_compliant(value: Any) -> bool:
+    """Return true only for an explicit compliant classification."""
+    return _normalize_shariah_status(value) == "compliant"
 
 
 def fetch_symbols(session: requests.Session) -> list[dict[str, Any]]:
@@ -122,7 +150,7 @@ def load_official_shariah_statuses() -> dict[str, str] | None:
             re.MULTILINE,
         )
         statuses = {
-            symbol.upper(): status.lower()
+            symbol.upper(): _normalize_shariah_status(status)
             for symbol, status in matches
         }
         if not statuses:
@@ -211,7 +239,7 @@ def parse_company_page(
             if soup.select_one(".quote__sector")
             else symbol_info.get("sectorName")
         ),
-        "shariah_status": "non-compliant" if non_compliant else shariah_status,
+        "shariah_status": "non-compliant" if non_compliant else _normalize_shariah_status(shariah_status),
     }
     quality_fields = (
         "company_name",
@@ -256,7 +284,7 @@ def store_stocks(stocks: list[dict[str, Any]]) -> None:
             stock.get("52_week_high"),
             stock.get("52_week_low"),
             stock.get("sector"),
-            stock.get("shariah_status", "unknown"),
+            _normalize_shariah_status(stock.get("shariah_status")),
             stock.get("data_quality", 0),
             json.dumps(stock.get("price_history", [])),
             now,
@@ -283,7 +311,7 @@ def _deserialize_stock(row: sqlite3.Row) -> dict[str, Any]:
         "52_week_high": row["week_52_high"],
         "52_week_low": row["week_52_low"],
         "sector": row["sector"],
-        "shariah_status": row["shariah_status"],
+        "shariah_status": _normalize_shariah_status(row["shariah_status"]),
         "data_quality": row["data_quality"],
         "price_history": history,
     }
@@ -305,6 +333,7 @@ def get_watchlist() -> list[dict[str, Any]]:
         FROM watchlist
         JOIN stocks ON stocks.symbol = watchlist.symbol
         WHERE watchlist.active = 1
+          AND LOWER(REPLACE(stocks.shariah_status, '_', '-')) = 'compliant'
         ORDER BY stocks.volume DESC, stocks.symbol ASC
         """
     )
@@ -318,6 +347,7 @@ def get_active_position_stocks() -> list[dict[str, Any]]:
         FROM trades
         JOIN stocks ON stocks.symbol = trades.symbol
         WHERE trades.closed_at IS NULL
+          AND LOWER(REPLACE(COALESCE(stocks.shariah_status, 'unknown'), '_', '-')) <> 'non-compliant'
         GROUP BY stocks.symbol
         ORDER BY stocks.symbol ASC
         """
@@ -366,6 +396,16 @@ def watchlist_needs_refresh(now: datetime | None = None) -> bool:
 
 def _replace_watchlist(stocks: list[dict[str, Any]]) -> None:
     """Replace the active watchlist and record the successful refresh atomically."""
+    compliant_stocks = [
+        stock for stock in stocks if _is_shariah_compliant(stock.get("shariah_status"))
+    ]
+    if len(compliant_stocks) != len(stocks):
+        LOGGER.error(
+            "Blocked %s non-compliant or unconfirmed stocks from watchlist persistence",
+            len(stocks) - len(compliant_stocks),
+        )
+    if not compliant_stocks:
+        raise ValueError("Refusing to replace watchlist without confirmed compliant stocks")
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.execute("DELETE FROM watchlist")
@@ -381,7 +421,7 @@ def _replace_watchlist(stocks: list[dict[str, Any]]) -> None:
                     f"15-day screen: compliant, Rs {stock['current_price']:.2f}, volume {stock['volume']:,}",
                     now,
                 )
-                for stock in stocks
+                for stock in compliant_stocks
             ],
         )
         connection.execute(
@@ -403,7 +443,7 @@ def refresh_watchlist() -> list[dict[str, Any]]:
     eligible = [
         item
         for item in symbols
-        if shariah_statuses.get(item["symbol"].upper()) == "compliant"
+        if _is_shariah_compliant(shariah_statuses.get(item["symbol"].upper()))
     ]
     LOGGER.info(
         "Starting full-universe watchlist scan: %s equities, %s confirmed Shariah compliant",
@@ -421,6 +461,9 @@ def refresh_watchlist() -> list[dict[str, Any]]:
             item,
             shariah_status="compliant",
         )
+        if not _is_shariah_compliant(stock.get("shariah_status")):
+            LOGGER.warning("Excluded %s after company page flagged it non-compliant", symbol)
+            continue
         price = stock.get("current_price")
         volume = stock.get("volume")
         if (
@@ -464,3 +507,70 @@ def refresh_watchlist() -> list[dict[str, Any]]:
 def scrape_stocks() -> list[dict[str, Any]]:
     """Backward-compatible alias for the full watchlist refresh."""
     return refresh_watchlist()
+
+
+def _announcement_type(title: str) -> str:
+    """Classify a PSX announcement title into a stable catalyst category."""
+    lowered = title.lower()
+    categories = (
+        ("financial_results", ("financial result", "earnings", "profit", "loss")),
+        ("dividend", ("dividend",)),
+        ("material_information", ("material information",)),
+        ("board_meeting", ("board meeting",)),
+        ("corporate_action", ("right share", "bonus share", "merger", "acquisition")),
+        ("management_change", ("appointment", "resignation", "chief executive", "director")),
+        ("disclosure", ("disclosure",)),
+    )
+    return next(
+        (category for category, terms in categories if any(term in lowered for term in terms)),
+        "other",
+    )
+
+
+def scrape_announcements(symbols: list[str]) -> list[dict[str, str]]:
+    """Fetch recent PSX company announcements and return matches for the supplied symbols."""
+    wanted = {str(symbol).strip().upper() for symbol in symbols if symbol}
+    if not wanted:
+        return []
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    response = _post_request(
+        session,
+        ANNOUNCEMENTS_URL,
+        {
+            "type": "C",
+            "symbol": "",
+            "query": "",
+            "count": 500,
+            "offset": 0,
+            "date_from": "",
+            "date_to": "",
+            "page": "annc",
+        },
+    )
+    if not response:
+        return []
+    announcements: list[dict[str, str]] = []
+    soup = BeautifulSoup(response.text, "html.parser")
+    for row in soup.select("#announcementsTable tbody tr"):
+        cells = row.find_all("td")
+        if len(cells) < 5:
+            continue
+        symbol = cells[2].get_text(" ", strip=True).upper()
+        if symbol not in wanted:
+            continue
+        title = cells[4].get_text(" ", strip=True)
+        announcements.append(
+            {
+                "symbol": symbol,
+                "title": title,
+                "date": cells[0].get_text(" ", strip=True),
+                "announcement_type": _announcement_type(title),
+            }
+        )
+    LOGGER.info(
+        "Loaded %s recent PSX announcements matching %s requested symbols",
+        len(announcements),
+        len(wanted),
+    )
+    return announcements

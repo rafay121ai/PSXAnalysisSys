@@ -99,13 +99,34 @@ def _heuristic_catalyst(articles: list[dict[str, Any]]) -> dict[str, Any]:
     return {"score": score, "summary": f"Matched catalyst terms: {', '.join(matches)}" if matches else "No clear catalyst", "method": "keywords"}
 
 
-def catalyst_analysis(stock: dict[str, Any], news: list[dict[str, Any]], use_ai: bool = True) -> dict[str, Any]:
-    """Use GPT-5.4 to classify relevant catalysts, with a local fallback."""
+def catalyst_analysis(
+    stock: dict[str, Any],
+    news: list[dict[str, Any]],
+    use_ai: bool = True,
+    announcements: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Use GPT-5.4 to classify relevant news and PSX announcement catalysts."""
     symbol = stock["symbol"]
-    relevant = [item for item in news if symbol in item.get("mentioned_symbols", [])]
+    relevant_news = [item for item in news if symbol in item.get("mentioned_symbols", [])]
+    relevant_announcements = [
+        item for item in announcements or [] if item.get("symbol") == symbol
+    ]
+    relevant = relevant_news + [
+        {
+            "headline": item.get("title", ""),
+            "full_text": item.get("announcement_type", ""),
+            "source": "PSX announcement",
+        }
+        for item in relevant_announcements
+    ]
     fallback = _heuristic_catalyst(relevant)
     if not relevant or not use_ai or not OPENAI_API_KEY:
-        return {**fallback, "articles_considered": len(relevant), "passed": fallback["score"] >= 1}
+        return {
+            **fallback,
+            "articles_considered": len(relevant_news),
+            "announcements_considered": len(relevant_announcements),
+            "passed": fallback["score"] >= 1,
+        }
     prompt = {
         "symbol": symbol,
         "company": stock.get("company_name"),
@@ -127,19 +148,36 @@ def catalyst_analysis(stock: dict[str, Any], news: list[dict[str, Any]], use_ai:
             "score": score,
             "summary": str(result.get("summary", ""))[:240],
             "method": OPENAI_MODEL,
-            "articles_considered": len(relevant),
+            "articles_considered": len(relevant_news),
+            "announcements_considered": len(relevant_announcements),
             "passed": score >= 1,
         }
     except Exception as exc:
         LOGGER.warning("GPT catalyst analysis failed for %s: %s", symbol, exc)
-        return {**fallback, "articles_considered": len(relevant), "passed": fallback["score"] >= 1}
+        return {
+            **fallback,
+            "articles_considered": len(relevant_news),
+            "announcements_considered": len(relevant_announcements),
+            "passed": fallback["score"] >= 1,
+        }
 
 
-def kelly_analysis(win_rate: float = 0.4, win_loss_ratio: float = 1.5) -> dict[str, Any]:
+def kelly_analysis(win_rate: float = 0.55, avg_win_loss_ratio: float = 1.8) -> dict[str, Any]:
     """Calculate a capped full-Kelly portfolio allocation."""
-    raw_kelly = win_rate - ((1 - win_rate) / win_loss_ratio) if win_loss_ratio > 0 else 0
+    raw_kelly = (
+        win_rate - ((1 - win_rate) / avg_win_loss_ratio)
+        if avg_win_loss_ratio > 0
+        else 0
+    )
     position = max(0.0, min(0.25, raw_kelly))
-    return {"win_rate": win_rate, "win_loss_ratio": win_loss_ratio, "position_size": position, "passed": position > 0.05}
+    return {
+        "win_rate": win_rate,
+        "avg_win_loss_ratio": avg_win_loss_ratio,
+        "win_loss_ratio": avg_win_loss_ratio,
+        "raw_kelly": raw_kelly,
+        "position_size": position,
+        "passed": position > 0.05,
+    }
 
 
 def munger_inversion(stock: dict[str, Any], news: list[dict[str, Any]], catalyst_score: int) -> dict[str, Any]:
@@ -175,11 +213,16 @@ def _risk_levels(stock: dict[str, Any]) -> tuple[float, float, float]:
     return round(stop, 2), round(target, 2), round((target - price) / risk, 2)
 
 
-def analyze_stock(stock: dict[str, Any], news: list[dict[str, Any]], use_ai: bool = True) -> dict[str, Any]:
+def analyze_stock(
+    stock: dict[str, Any],
+    news: list[dict[str, Any]],
+    use_ai: bool = True,
+    announcements: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Run all five frameworks and return a structured recommendation."""
     weinstein = weinstein_analysis(stock)
     minervini = minervini_analysis(stock)
-    catalyst = catalyst_analysis(stock, news, use_ai=use_ai)
+    catalyst = catalyst_analysis(stock, news, use_ai=use_ai, announcements=announcements)
     kelly = kelly_analysis()
     munger = munger_inversion(stock, news, catalyst["score"])
     details = {
@@ -214,7 +257,15 @@ def analyze_stock(stock: dict[str, Any], news: list[dict[str, Any]], use_ai: boo
     }
 
 
-def analyze_all(stocks: list[dict[str, Any]], news: list[dict[str, Any]], use_ai: bool = True) -> list[dict[str, Any]]:
+def analyze_all(
+    stocks: list[dict[str, Any]],
+    news: list[dict[str, Any]],
+    use_ai: bool = True,
+    announcements: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Analyze every stock and sort actionable picks ahead of skipped stocks."""
-    results = [analyze_stock(stock, news, use_ai=use_ai) for stock in stocks]
+    results = [
+        analyze_stock(stock, news, use_ai=use_ai, announcements=announcements)
+        for stock in stocks
+    ]
     return sorted(results, key=lambda item: (item["tier"] == 0, item["tier"], -item["confidence_score"]))

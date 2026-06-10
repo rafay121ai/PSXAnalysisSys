@@ -14,6 +14,7 @@ from scrapers.psx import (
     get_watchlist,
     initialize_database,
     refresh_watchlist,
+    scrape_announcements,
     watchlist_needs_refresh,
 )
 
@@ -73,6 +74,7 @@ def run(
     initialize_database()
     if test:
         stocks, news = dummy_data()
+        announcements = []
         use_ai = False
     else:
         if force_refresh or watchlist_needs_refresh():
@@ -85,16 +87,19 @@ def run(
         else:
             stocks = get_active_position_stocks()
             LOGGER.info("Monitoring loaded %s stocks with active trades", len(stocks))
-        LOGGER.info("Stage 1/4 complete: loaded %s stocks for %s", len(stocks), mode)
-        LOGGER.info("Stage 2/4: scraping company news")
+        LOGGER.info("Stage 1/5 complete: loaded %s stocks for %s", len(stocks), mode)
+        LOGGER.info("Stage 2/5: scraping company news")
         news = scrape_news([stock["symbol"] for stock in stocks])
-        LOGGER.info("Stage 2/4 complete: %s articles", len(news))
-    LOGGER.info("Stage 3/4: analyzing %s stocks", len(stocks))
-    results = analyze_all(stocks, news, use_ai=use_ai)
-    LOGGER.info("Stage 3/4 complete: %s actionable picks", sum(result["tier"] > 0 for result in results))
+        LOGGER.info("Stage 2/5 complete: %s articles", len(news))
+        LOGGER.info("Stage 3/5: scraping PSX company announcements")
+        announcements = scrape_announcements([stock["symbol"] for stock in stocks])
+        LOGGER.info("Stage 3/5 complete: %s matching announcements", len(announcements))
+    LOGGER.info("Stage 4/5: analyzing %s stocks", len(stocks))
+    results = analyze_all(stocks, news, use_ai=use_ai, announcements=announcements)
+    LOGGER.info("Stage 4/5 complete: %s actionable picks", sum(result["tier"] > 0 for result in results))
     report = format_report(results, stocks, mode)
     print(report)
-    LOGGER.info("Stage 4/4: sending Telegram report")
+    LOGGER.info("Stage 5/5: sending Telegram report")
     if not send_report(report):
         LOGGER.error("Pipeline completed, but Telegram delivery failed")
         return 1
