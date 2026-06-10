@@ -43,6 +43,21 @@ CREATE TABLE IF NOT EXISTS shariah_universe (
     fetched_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS fundamentals (
+    symbol TEXT PRIMARY KEY,
+    pe_ratio REAL,
+    eps_trailing REAL,
+    market_cap REAL,
+    shares_outstanding REAL,
+    free_float_percent REAL,
+    debt_to_equity REAL,
+    book_value REAL,
+    dividend_yield REAL,
+    sector TEXT,
+    source TEXT NOT NULL,
+    scraped_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS watchlist (
     symbol TEXT PRIMARY KEY,
     company_name TEXT,
